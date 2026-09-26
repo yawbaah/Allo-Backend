@@ -165,6 +165,8 @@ CSRF_TRUSTED_ORIGINS = [
     'https://*.up.railway.app',
     'http://localhost:5173',
     'http://localhost:3000',
+    'https://allo-backend-production-0fb3.up.railway.app',
+
 ]
 
 # ---------------------------------------------------------------------------
