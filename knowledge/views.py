@@ -1,6 +1,7 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status, permissions
+from django.conf import settings
 from django.core.files.storage import default_storage
 
 from .models import Source
@@ -63,8 +64,9 @@ class SourceListView(APIView):
                     source_type = 'image'
 
             save_path = default_storage.save(f'sources/{company.id}/{name}', f)
+            backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000').rstrip('/')
             thumbnail_url = (
-                f'http://localhost:8000/media/{save_path}' if source_type == 'image' else ''
+                f'{backend_url}/media/{save_path}' if source_type == 'image' else ''
             )
 
             source = Source.objects.create(

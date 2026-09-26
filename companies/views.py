@@ -1,10 +1,14 @@
 from datetime import timedelta
+import os
+from django.conf import settings
 from django.utils import timezone
 from django.db.models import Count, Q
+from django.core.files.storage import default_storage
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status, permissions
 
+from .models import Company
 from .serializers import CompanySerializer
 from chat.models import Conversation, Message
 from knowledge.models import Source, DocumentChunk
@@ -25,11 +29,30 @@ class CompanyMeView(APIView):
         if not company:
             return Response({"error": "No company associated with this user."}, status=status.HTTP_404_NOT_FOUND)
 
+        # 1. Handle permanent logo file upload if provided
+        if 'logo_file' in request.FILES:
+            logo_file = request.FILES['logo_file']
+
+            # Clean up old logo file from disk if it exists
+            if company.widget_logo_url:
+                try:
+                    old_path = company.widget_logo_url.split('/media/')[-1]
+                    if default_storage.exists(old_path):
+                        default_storage.delete(old_path)
+                except Exception:
+                    pass
+
+            save_path = default_storage.save(f'logos/{company.id}/{logo_file.name}', logo_file)
+            backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000').rstrip('/')
+            company.widget_logo_url = f"{backend_url}/media/{save_path}"
+            company.save(update_fields=['widget_logo_url'])
+
+        # 2. Update text and configuration fields
         serializer = CompanySerializer(company, data=request.data, partial=True)
         if serializer.is_valid():
             serializer.save()
-            return Response(serializer.data, status=status.HTTP_200_OK)
-            
+            return Response(CompanySerializer(company).data, status=status.HTTP_200_OK)
+
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -43,16 +66,15 @@ class CompanyAnalyticsView(APIView):
 
         now = timezone.now()
         thirty_days_ago = now - timedelta(days=30)
-        seven_days_ago = now - timedelta(days=7)
 
         # 1. Total & Monthly Conversations
         all_conversations = Conversation.objects.filter(company=company)
         total_conversations_count = all_conversations.count()
-        
+
         # 2. AI Resolution Rate
         ai_resolved_count = all_conversations.filter(status='ai').count()
         human_handoff_count = all_conversations.filter(status__in=['human', 'live']).count()
-        
+
         if total_conversations_count > 0:
             ai_resolution_pct = round((ai_resolved_count / total_conversations_count) * 100)
         else:

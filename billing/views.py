@@ -116,6 +116,77 @@ def send_welcome_and_activation_email(company, email_address, plan_name):
         print(f"⚠️ [MAIL SYSTEM WARNING] Could not send email to {email_address}: {e}")
 
 
+def send_dunning_warning_email(company, email_address):
+    """
+    Sends a structured HTML email warning the administrator that their
+    unpaid/failed subscription has locked their live customer widget.
+    """
+    subject = "Action Required: Your Allo subscription is past due ⚠️"
+    billing_url = f"{settings.FRONTEND_URL}/dashboard/billing"
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <body style="margin:0;padding:0;background-color:#000000;font-family:system-ui,-apple-system,sans-serif;color:#ffffff;">
+      <table width="100%" style="background-color:#000000;padding:40px 20px;">
+        <tr>
+          <td align="center">
+            <table width="100%" style="max-width:540px;background-color:#09090b;border:1px solid #ef4444;border-radius:12px;overflow:hidden;">
+              <tr>
+                <td style="padding:32px 24px;border-bottom:1px solid #27272a;text-align:center;">
+                  <h1 style="margin:0;font-size:28px;font-weight:600;letter-spacing:-0.05em;color:#ffffff;font-family:Georgia,serif;">Allo</h1>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:40px 32px;">
+                  <h2 style="margin:0 0 16px;font-size:20px;font-weight:500;letter-spacing:-0.02em;color:#fca5a5;">Subscription Payment Failed / Past Due ⚠️</h2>
+                  <p style="margin:0 0 24px;color:#a1a1aa;font-size:15px;line-height:1.6;">
+                    Hello, <br><br>
+                    Our system was unable to process your recurring subscription payment for <strong>{company.name}</strong>.
+                  </p>
+                  
+                  <div style="background-color:rgba(239, 68, 68, 0.08);border:1px solid #ef4444;border-radius:8px;padding:20px;margin-bottom:32px;">
+                    <p style="margin:0;color:#fca5a5;font-size:14px;line-height:1.5;">
+                      <strong>CRITICAL WIDGET STATUS: LOCKED</strong><br>
+                      Due to an unpaid invoice, your live website chatbot widget has ceased serving automatic answers. 
+                    </p>
+                  </div>
+
+                  <p style="margin:0 0 32px;color:#a1a1aa;font-size:15px;line-height:1.6;">
+                    Please update your payment card information or settle the outstanding invoice immediately to restore services.
+                  </p>
+
+                  <div style="text-align:center;">
+                    <a href="{billing_url}" 
+                       style="display:inline-block;background-color:#ef4444;color:#ffffff;text-decoration:none;
+                              padding:14px 28px;border-radius:6px;font-size:14px;font-weight:600;
+                              text-transform:uppercase;letter-spacing:0.05em;">
+                      Update Payment Details
+                    </a>
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+    """
+    try:
+        send_mail(
+            subject=subject,
+            message=f"Action Required: Your Allo payment has failed. Update billing details at: {billing_url}",
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email_address],
+            fail_silently=False,
+            html_message=html_content,
+        )
+        print(f"📧 [MAIL SYSTEM] Dunning warning email dispatched to: {email_address}")
+    except Exception as e:
+        print(f"⚠️ [MAIL SYSTEM ERROR] Could not dispatch dunning email to {email_address}: {e}")
+
+
 class BillingDashboardView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -202,7 +273,7 @@ class CreateBillingPortalView(APIView):
         company = getattr(request.user, 'company', None)
         if not company or not company.stripe_customer_id:
             return Response(
-                {"error": "No active billing history found for this company."},
+                {"error": "No active billing history found. Please purchase a plan first to register your customer profile."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -213,8 +284,17 @@ class CreateBillingPortalView(APIView):
                 return_url=f"{frontend_url}/dashboard/billing",
             )
             return Response({"portal_url": portal_session.url}, status=status.HTTP_200_OK)
+            
+        except stripe.error.StripeError as e:
+            # USER-FRIENDLY EXCEPTION BOUNDARY: Catches Stripe-specific errors
+            print(f"[Stripe Portal Error] {e}")
+            return Response(
+                {"error": "Billing portal is temporarily unavailable. If you haven't completed your initial subscription payment, please select a plan first."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            print(f"[General Portal Error] {e}")
+            return Response({"error": "An unexpected server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @method_decorator(csrf_exempt, name='dispatch')
@@ -241,7 +321,6 @@ class StripeWebhookView(APIView):
             print("❌ [STRIPE WEBHOOK ERROR] Verification failed. Check your Webhook Signing Secret.")
             return Response({"error": "Invalid webhook signature."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Convert stripe event object to standard dict safely
         event_dict = event.to_dict() if hasattr(event, 'to_dict') else dict(event)
         event_type = event_dict.get('type')
         data_object = event_dict.get('data', {}).get('object', {})
@@ -294,7 +373,6 @@ class StripeWebhookView(APIView):
                 company.save()
                 print(f"✅ [STRIPE WEBHOOK SUCCESS] Company '{company.name}' unlocked and set to 'active' on {company.plan} plan.")
 
-                # Send activation email
                 recipient_email = None
                 associated_user = company.users.first()
                 if associated_user:
@@ -309,7 +387,7 @@ class StripeWebhookView(APIView):
             else:
                 print(f"❌ [STRIPE WEBHOOK ERROR] No matching company found for company_id: {company_id}")
 
-        # 2. Subscription updated or deleted
+        # 2. Subscription updated, cancelled, or delinquent
         elif event_type in ["customer.subscription.updated", "customer.subscription.deleted"]:
             sub_id = data_object.get('id')
             sub_status = data_object.get('status')
@@ -317,21 +395,40 @@ class StripeWebhookView(APIView):
 
             company = Company.objects.filter(stripe_subscription_id=sub_id).first()
             if company:
+                old_period_start = company.current_period_start
                 company.subscription_status = sub_status
 
                 period_start = data_object.get('current_period_start')
                 period_end = data_object.get('current_period_end')
 
                 if period_start:
-                    company.current_period_start = datetime.fromtimestamp(period_start, tz=dt_timezone.utc)
+                    new_period_start = datetime.fromtimestamp(period_start, tz=dt_timezone.utc)
+                    # If the billing period has changed, reset the usage counter
+                    if old_period_start and new_period_start > old_period_start:
+                        company.reset_usage()
+                        print(f"🔄 [BILLING CYCLE RESET] Usage counter reset for '{company.name}'.")
+                    company.current_period_start = new_period_start
+
                 if period_end:
                     company.current_period_end = datetime.fromtimestamp(period_end, tz=dt_timezone.utc)
 
-                if event_type == "customer.subscription.deleted" or sub_status == "canceled":
-                    company.plan = 'starter'
-                    company.subscription_status = 'unpaid'
-                    company.stripe_subscription_id = None
-                    print(f"📉 [STRIPE WEBHOOK] Subscription canceled. Company '{company.name}' locked.")
+                # Lock the account if Stripe marks the subscription delinquent, past_due, canceled, or unpaid
+                if event_type == "customer.subscription.deleted" or sub_status in ["canceled", "unpaid", "past_due"]:
+                    company.subscription_status = 'unpaid'  # Lock dashboard & block API access
+
+                    # Extract target recipient email
+                    recipient_email = None
+                    associated_user = company.users.first()
+                    if associated_user:
+                        recipient_email = associated_user.email
+                    else:
+                        recipient_email = company.support_email
+
+                    # Fire off alert warning email
+                    if recipient_email:
+                        send_dunning_warning_email(company, recipient_email)
+
+                    print(f"📉 [STRIPE WEBHOOK] Subscription is delinquent or deleted. Company '{company.name}' locked.")
                 else:
                     items_data = data_object.get('items', {}).get('data', [])
                     if items_data:

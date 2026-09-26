@@ -18,6 +18,7 @@ from .services import (
     broadcast_ws_message,
     broadcast_dash_alert,
     UsageLimitExceededException,
+    SubscriptionExpiredException,
 )
 
 
@@ -68,9 +69,33 @@ class WidgetChatView(APIView):
                 status=status.HTTP_200_OK,
             )
 
+        except SubscriptionExpiredException:
+            # If delinquent/unpaid, return a polite notice and block AI/human completions
+            return Response(
+                {
+                    "conversation_id": data.get('conversation_id') or "",
+                    "status": "resolved",
+                    "messages": [
+                        {
+                            "id": "expired-err-user",
+                            "sender_role": "user",
+                            "content": data['message'],
+                            "created_at": timezone.now().isoformat()
+                        },
+                        {
+                            "id": "expired-err-bot",
+                            "sender_role": "ai",
+                            "content": "Support features are temporarily unavailable for this domain.",
+                            "created_at": timezone.now().isoformat()
+                        }
+                    ],
+                    "subscription_expired": True
+                },
+                status=status.HTTP_200_OK
+            )
+
         except UsageLimitExceededException:
-            # Fallback action: Inform the visitor and escalate directly to human
-            # without triggering OpenAI model endpoints, preserving API cost metrics.
+            # Fallback direct escalation to human if they exceed their monthly message limit
             return Response(
                 {
                     "conversation_id": data.get('conversation_id') or "",

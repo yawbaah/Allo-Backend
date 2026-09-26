@@ -16,6 +16,11 @@ from .serializers import MessageSerializer
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 
+class SubscriptionExpiredException(Exception):
+    """Exception raised when a company's subscription has expired or is delinquent."""
+    pass
+
+
 class UsageLimitExceededException(Exception):
     """Exception raised when a company has exhausted its monthly message quota."""
     pass
@@ -226,7 +231,11 @@ def process_visitor_message(
     conversation_id=None,
 ) -> tuple[Conversation, Message, Message]:
 
-    # 1. Enforce Credit Quotas BEFORE triggering OpenAI vector models or prompt queries
+    # 1. If their subscription status is not 'active', lock them out entirely
+    if company.subscription_status != 'active':
+        raise SubscriptionExpiredException(f"Company {company.id} subscription is inactive.")
+
+    # 2. If they have run out of monthly credits, raise quota limit exception
     if not company.has_active_credits():
         raise UsageLimitExceededException(f"Company {company.id} has reached its plan message limits.")
 
@@ -264,6 +273,9 @@ def process_visitor_message(
         sender_role='ai',
         content=answer,
     )
+
+    # INCREMENT USAGE COUNTER
+    company.increment_usage()
 
     # Broadcast the AI reply over the WebSocket group instantly
     broadcast_ws_message(str(conversation.id), MessageSerializer(ai_msg).data)

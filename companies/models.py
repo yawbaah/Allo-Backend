@@ -1,6 +1,10 @@
+import os
 import uuid
 from django.db import models
 from django.utils import timezone
+
+# Configurable limit for testing. Set ALLO_DEV_MSG_LIMIT=5 in .env to test quickly.
+DEV_LIMIT = int(os.getenv('ALLO_DEV_MSG_LIMIT', '0'))
 
 PLAN_LIMITS = {
     'starter': 1000,
@@ -43,6 +47,9 @@ class Company(models.Model):
     current_period_start = models.DateTimeField(blank=True, null=True)
     current_period_end = models.DateTimeField(blank=True, null=True)
 
+    # INDEPENDENT USAGE COUNTER (decoupled from Stripe)
+    monthly_message_count = models.IntegerField(default=0)
+
     widget_name = models.CharField(max_length=100, default='Support')
     widget_color = models.CharField(max_length=20, default='#ffffff')
     widget_position = models.CharField(max_length=10, choices=POSITION_CHOICES, default='right')
@@ -63,23 +70,29 @@ class Company(models.Model):
 
     @property
     def max_monthly_messages(self) -> int:
+        # If dev limit is set in .env, override plan limits for testing
+        if DEV_LIMIT > 0:
+            return DEV_LIMIT
         return PLAN_LIMITS.get(self.plan, 1000)
 
     def get_current_period_usage(self) -> int:
-        from chat.models import Message
-        start_date = self.current_period_start
-        if not start_date:
-            start_date = timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        return Message.objects.filter(
-            conversation__company=self,
-            sender_role='ai',
-            created_at__gte=start_date
-        ).count()
+        return self.monthly_message_count
+
+    def increment_usage(self):
+        """Atomically increments the message counter by 1."""
+        Company.objects.filter(pk=self.pk).update(
+            monthly_message_count=models.F('monthly_message_count') + 1
+        )
+        self.refresh_from_db()
+
+    def reset_usage(self):
+        """Resets the counter when a new billing period begins."""
+        self.monthly_message_count = 0
+        self.save(update_fields=['monthly_message_count'])
 
     def has_active_credits(self) -> bool:
         if self.plan == 'enterprise':
             return True
-        # ONLY 'active' grants access. No trialing, no unpaid, no canceled.
         if self.subscription_status != 'active':
             return False
-        return self.get_current_period_usage() < self.max_monthly_messages
+        return self.monthly_message_count < self.max_monthly_messages

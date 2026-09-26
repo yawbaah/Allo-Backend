@@ -114,9 +114,10 @@ def process_and_index_source(source_id: str):
 
         elif source.type == 'image':
             # Enrich image chunks with rich search keywords + Markdown image link
-            img_url = source.thumbnail_url or f"http://localhost:8000/media/{source.url_or_path}"
+            backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000').rstrip('/')
+            img_url = source.thumbnail_url or f"{backend_url}/media/{source.url_or_path}"
             desc = source.image_description or source.title
-            
+
             raw_text = (
                 f"Company Image, Logo, Visual, Photo, Picture: {source.title}. "
                 f"Description: {desc}. "
