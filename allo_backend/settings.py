@@ -171,14 +171,14 @@ CSRF_TRUSTED_ORIGINS = [
 
 # ---------------------------------------------------------------------------
 # EMAIL
+# -----------------------------------------------------------------------# ---------------------------------------------------------------------------
+# EMAIL  (Brevo HTTP API — Railway blocks outbound SMTP)
 # ---------------------------------------------------------------------------
-if os.getenv('EMAIL_HOST_USER'):
-    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-    EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp-relay.brevo.com')
-    EMAIL_PORT = int(os.getenv('EMAIL_PORT', 587))
-    EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER')
-    EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD')
-    EMAIL_USE_TLS = True
+BREVO_API_KEY = os.getenv('BREVO_API_KEY')
+EMAIL_TIMEOUT = 15
+
+if BREVO_API_KEY:
+    EMAIL_BACKEND = 'accounts.email_backend.BrevoAPIEmailBackend'
 else:
     EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 
