@@ -5,8 +5,52 @@ from django.core.mail import send_mail
 from django.conf import settings
 from .models import EmailCode
 
+# How long a code stays valid — keep this in sync with the email template text
+CODE_EXPIRY_MINUTES = 15
+
+
 def generate_6digit_code():
+    """Generate a random 6-digit code as a string."""
     return f"{random.randint(100000, 999999)}"
+
+
+# Alias so views/tasks can import a clearly-named helper
+create_code = generate_6digit_code
+
+
+def issue_code(user, purpose):
+    """
+    Invalidate any previous unused codes for this purpose, create a fresh one,
+    and return the code string. Does NOT send email (that's the Celery task's job).
+    """
+    EmailCode.objects.filter(user=user, purpose=purpose, used=False).update(used=True)
+
+    code_str = generate_6digit_code()
+
+    EmailCode.objects.create(
+        user=user,
+        code=code_str,
+        purpose=purpose,
+        expires_at=timezone.now() + timedelta(minutes=CODE_EXPIRY_MINUTES),
+    )
+
+    return code_str
+
+
+def get_email_copy(purpose):
+    """Returns (subject, title, description) for a given code purpose."""
+    if purpose == 'verify_email':
+        return (
+            "Allo - Verify your email",
+            "Verify your email address",
+            "Welcome to Allo! To complete your setup and access your dashboard, enter the code below.",
+        )
+    return (
+        "Allo - Password Reset Code",
+        "Reset your password",
+        "We received a request to reset your password. Enter the code below to choose a new password.",
+    )
+
 
 def get_html_email_template(title, code, description):
     """Generates a premium, dark-mode HTML email matching Allo's brand."""
@@ -33,7 +77,7 @@ def get_html_email_template(title, code, description):
                                     <span style="font-size: 32px; font-weight: 300; letter-spacing: 0.3em; color: #ffffff;">{code}</span>
                                 </div>
                                 <p style="margin: 0; font-size: 13px; color: #71717a;">
-                                    This code expires in 15 minutes. If you didn't request this, please ignore this email.
+                                    This code expires in {CODE_EXPIRY_MINUTES} minutes. If you didn't request this, please ignore this email.
                                 </p>
                             </td>
                         </tr>
@@ -48,27 +92,15 @@ def get_html_email_template(title, code, description):
     </html>
     """
 
+
 def create_and_send_code(user, purpose):
-    EmailCode.objects.filter(user=user, purpose=purpose, used=False).update(used=True)
-
-    code_str = generate_6digit_code()
-    expires_at = timezone.now() + timedelta(minutes=15)
-
-    EmailCode.objects.create(
-        user=user,
-        code=code_str,
-        purpose=purpose,
-        expires_at=expires_at,
-    )
-
-    if purpose == 'verify_email':
-        subject = "Allo - Verify your email"
-        title = "Verify your email address"
-        desc = "Welcome to Allo! To complete your setup and access your dashboard, enter the code below."
-    else:
-        subject = "Allo - Password Reset Code"
-        title = "Reset your password"
-        desc = "We received a request to reset your password. Enter the code below to choose a new password."
+    """
+    LEGACY synchronous helper (blocking). Kept only for backward compatibility
+    with any old code paths. New code should use issue_code() + the Celery
+    tasks in accounts/tasks.py.
+    """
+    code_str = issue_code(user, purpose)
+    subject, title, desc = get_email_copy(purpose)
 
     html_content = get_html_email_template(title, code_str, desc)
     plain_content = f"{title}\n\n{desc}\n\nCode: {code_str}"
@@ -80,7 +112,7 @@ def create_and_send_code(user, purpose):
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[user.email],
             fail_silently=False,
-            html_message=html_content, # <--- This sends the beautiful UI!
+            html_message=html_content,
         )
     except Exception as e:
         print(f"Error sending email to {user.email}: {e}")
