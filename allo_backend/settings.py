@@ -29,6 +29,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'corsheaders',
+    'storages',
 
     'companies',
     'knowledge',
@@ -39,7 +40,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',  # Serves static files in production
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -69,7 +70,7 @@ WSGI_APPLICATION = 'allo_backend.wsgi.application'
 ASGI_APPLICATION = 'allo_backend.asgi.application'
 
 # ---------------------------------------------------------------------------
-# DATABASE (Dynamic Railway DATABASE_URL with fallback to local)
+# DATABASE
 # ---------------------------------------------------------------------------
 DATABASE_URL = os.getenv('DATABASE_URL')
 if DATABASE_URL:
@@ -130,10 +131,65 @@ USE_TZ = True
 
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# ---------------------------------------------------------------------------
+# R2 OBJECT STORAGE (production media)
+# ---------------------------------------------------------------------------
+R2_ACCOUNT_ID = os.getenv('R2_ACCOUNT_ID', '')
+R2_ACCESS_KEY_ID = os.getenv('R2_ACCESS_KEY_ID', '')
+R2_SECRET_ACCESS_KEY = os.getenv('R2_SECRET_ACCESS_KEY', '')
+R2_BUCKET_NAME = os.getenv('R2_BUCKET_NAME', '')
+R2_PUBLIC_BASE_URL = os.getenv('R2_PUBLIC_BASE_URL', '').rstrip('/')
+R2_REGION_NAME = os.getenv('R2_REGION_NAME', 'auto')
+
+R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else None
+
+USE_R2 = bool(
+    R2_BUCKET_NAME
+    and R2_ACCESS_KEY_ID
+    and R2_SECRET_ACCESS_KEY
+    and R2_ENDPOINT_URL
+)
+
+if USE_R2:
+    AWS_ACCESS_KEY_ID = R2_ACCESS_KEY_ID
+    AWS_SECRET_ACCESS_KEY = R2_SECRET_ACCESS_KEY
+    AWS_STORAGE_BUCKET_NAME = R2_BUCKET_NAME
+    AWS_S3_ENDPOINT_URL = R2_ENDPOINT_URL
+    AWS_S3_REGION_NAME = R2_REGION_NAME
+    AWS_S3_SIGNATURE_VERSION = 's3v4'
+    AWS_DEFAULT_ACL = None
+    AWS_S3_FILE_OVERWRITE = False
+    AWS_QUERYSTRING_AUTH = False
+
+    try:
+        from urllib.parse import urlparse
+        _parsed = urlparse(R2_PUBLIC_BASE_URL) if R2_PUBLIC_BASE_URL else None
+        if _parsed and _parsed.netloc:
+            AWS_S3_CUSTOM_DOMAIN = _parsed.netloc
+    except Exception:
+        pass
+
+    STORAGES = {
+        "default": {
+            "BACKEND": "storages.backends.s3.S3Storage",
+        },
+        "staticfiles": {
+            "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+        },
+    }
+else:
+    STORAGES = {
+        "default": {
+            "BACKEND": "django.core.files.storage.FileSystemStorage",
+        },
+        "staticfiles": {
+            "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+        },
+    }
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
@@ -166,13 +222,10 @@ CSRF_TRUSTED_ORIGINS = [
     'http://localhost:5173',
     'http://localhost:3000',
     'https://allo-backend-production-0fb3.up.railway.app',
-
 ]
 
 # ---------------------------------------------------------------------------
-# EMAIL
-# -----------------------------------------------------------------------# ---------------------------------------------------------------------------
-# EMAIL  (Brevo HTTP API — Railway blocks outbound SMTP)
+# EMAIL (Brevo HTTP API — Railway blocks outbound SMTP)
 # ---------------------------------------------------------------------------
 BREVO_API_KEY = os.getenv('BREVO_API_KEY')
 EMAIL_TIMEOUT = 15

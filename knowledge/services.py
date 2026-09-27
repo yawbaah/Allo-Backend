@@ -1,5 +1,7 @@
+import io
 import os
 import re
+from urllib.parse import quote
 import httpx
 from bs4 import BeautifulSoup
 from django.conf import settings
@@ -15,6 +17,10 @@ client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 def clean_text(text: str) -> str:
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
+
+
+def _is_http_url(s: str) -> bool:
+    return bool(s) and (s.startswith('http://') or s.startswith('https://'))
 
 
 def scrape_url(url: str) -> str:
@@ -33,8 +39,8 @@ def scrape_url(url: str) -> str:
     return clean_text(text)
 
 
-def extract_pdf_text(file_path: str) -> str:
-    reader = PdfReader(file_path)
+def extract_pdf_bytes(data: bytes) -> str:
+    reader = PdfReader(io.BytesIO(data))
     text = ""
     for page in reader.pages:
         extracted = page.extract_text()
@@ -43,10 +49,48 @@ def extract_pdf_text(file_path: str) -> str:
     return clean_text(text)
 
 
-def extract_docx_text(file_path: str) -> str:
-    doc = DocxDocument(file_path)
+def extract_docx_bytes(data: bytes) -> str:
+    doc = DocxDocument(io.BytesIO(data))
     full_text = [para.text for para in doc.paragraphs if para.text]
     return clean_text(" ".join(full_text))
+
+
+def _read_file_source_to_bytes(url_or_path: str) -> bytes:
+    use_r2 = getattr(settings, 'USE_R2', False)
+
+    if _is_http_url(url_or_path):
+        with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+            r = c.get(url_or_path)
+            r.raise_for_status()
+            return r.content
+
+    normalized = url_or_path.lstrip("/")
+    if normalized.startswith("media/"):
+        normalized = normalized[len("media/"):]
+
+    if use_r2:
+        from .r2_storage import download_bytes
+        return download_bytes(normalized)
+
+    full_path = os.path.join(settings.MEDIA_ROOT, normalized)
+    with open(full_path, 'rb') as f:
+        return f.read()
+
+
+def _absolute_media_url(value: str) -> str:
+    if not value:
+        return value
+    if _is_http_url(value):
+        return value.replace(" ", "%20")
+    clean = value.lstrip("/")
+    if clean.startswith("media/"):
+        clean = clean[len("media/"):]
+    safe = quote(clean, safe="/")
+    use_r2 = getattr(settings, 'USE_R2', False)
+    if use_r2 and getattr(settings, 'R2_PUBLIC_BASE_URL', ''):
+        return f"{settings.R2_PUBLIC_BASE_URL.rstrip('/')}/{safe}"
+    backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000').rstrip('/')
+    return f"{backend_url}/media/{safe}"
 
 
 def chunk_text(text: str, max_chars: int = 1000, overlap: int = 150) -> list[str]:
@@ -98,26 +142,18 @@ def process_and_index_source(source_id: str):
             raw_text = scrape_url(source.url_or_path)
 
         elif source.type in ('pdf', 'docx'):
-            if os.path.isabs(source.url_or_path):
-                full_path = source.url_or_path
-            else:
-                full_path = os.path.join(settings.MEDIA_ROOT, source.url_or_path.replace('media/', ''))
-
+            data = _read_file_source_to_bytes(source.url_or_path)
             if source.type == 'pdf':
-                raw_text = extract_pdf_text(full_path)
+                raw_text = extract_pdf_bytes(data)
             else:
-                raw_text = extract_docx_text(full_path)
+                raw_text = extract_docx_bytes(data)
 
         elif source.type == 'text':
-            # Manual notes — full body lives in image_description
             raw_text = source.image_description or source.title
 
         elif source.type == 'image':
-            # Enrich image chunks with rich search keywords + Markdown image link
-            backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000').rstrip('/')
-            img_url = source.thumbnail_url or f"{backend_url}/media/{source.url_or_path}"
+            img_url = _absolute_media_url(source.thumbnail_url or source.url_or_path)
             desc = source.image_description or source.title
-
             raw_text = (
                 f"Company Image, Logo, Visual, Photo, Picture: {source.title}. "
                 f"Description: {desc}. "
@@ -136,10 +172,7 @@ def process_and_index_source(source_id: str):
             source.save(update_fields=['status'])
             return
 
-        # Clear previous chunks for re-indexing
         DocumentChunk.objects.filter(source=source).delete()
-
-        # Generate embeddings
         embeddings = get_openai_embeddings(chunks)
 
         chunk_objects = []

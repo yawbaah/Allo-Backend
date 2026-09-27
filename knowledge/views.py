@@ -1,3 +1,5 @@
+import re
+import uuid
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status, permissions
@@ -7,11 +9,53 @@ from django.core.files.storage import default_storage
 from .models import Source
 from .serializers import SourceSerializer
 from .tasks import process_and_index_source_task
-from billing.permissions import HasPaidSubscription  # <-- Import our paywall
+from billing.permissions import HasPaidSubscription
+
+
+def _safe_filename(original: str) -> str:
+    original = (original or "file").strip().replace(" ", "_")
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', original)
+    if not safe or safe in (".", ".."):
+        safe = "file"
+    prefix = uuid.uuid4().hex[:8]
+    return f"{prefix}_{safe}"[:200]
+
+
+def _public_url_for_key(save_path: str) -> str:
+    use_r2 = getattr(settings, 'USE_R2', False)
+    if use_r2:
+        try:
+            url = default_storage.url(save_path)
+            if url.startswith("//"):
+                return "https:" + url
+            if url.startswith("http://") or url.startswith("https://"):
+                return url.replace(" ", "%20")
+        except Exception:
+            pass
+        base = getattr(settings, 'R2_PUBLIC_BASE_URL', '').rstrip('/')
+        if base:
+            return f"{base}/{save_path.replace(' ', '%20')}"
+        return save_path
+    backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000').rstrip('/')
+    return f"{backend_url}/media/{save_path}"
+
+
+def _key_from_stored_url(value: str) -> str:
+    if not value:
+        return ""
+    if value.startswith("manual://"):
+        return ""
+    base = getattr(settings, 'R2_PUBLIC_BASE_URL', '').rstrip('/')
+    if base and value.startswith(base):
+        return value[len(base):].lstrip("/")
+    if "/media/" in value:
+        return value.split("/media/")[-1].lstrip("/")
+    if value.startswith("http://") or value.startswith("https://"):
+        return ""
+    return value.lstrip("/")
 
 
 class SourceListView(APIView):
-    # Enforce standard authentication AND strict paid subscription checks
     permission_classes = [permissions.IsAuthenticated, HasPaidSubscription]
 
     def get(self, request):
@@ -44,16 +88,15 @@ class SourceListView(APIView):
                 image_description=content,
                 status='processing',
             )
-            # Dispatch to Celery background task
             process_and_index_source_task.delay(str(source.id))
             return Response(SourceSerializer(source).data, status=status.HTTP_202_ACCEPTED)
 
         # ---------- FILE / IMAGE ----------
         if 'file' in request.FILES:
             f = request.FILES['file']
+            original_name = f.name or "upload"
             source_type = request.data.get('type') or 'pdf'
-            name = f.name
-            ext = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
+            ext = original_name.rsplit('.', 1)[-1].lower() if '.' in original_name else ''
 
             if source_type not in ('pdf', 'docx', 'image'):
                 if ext == 'pdf':
@@ -63,22 +106,23 @@ class SourceListView(APIView):
                 else:
                     source_type = 'image'
 
-            save_path = default_storage.save(f'sources/{company.id}/{name}', f)
-            backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000').rstrip('/')
-            thumbnail_url = (
-                f'{backend_url}/media/{save_path}' if source_type == 'image' else ''
-            )
+            safe_name = _safe_filename(original_name)
+            save_path = default_storage.save(f'sources/{company.id}/{safe_name}', f)
+
+            if source_type == 'image':
+                thumbnail_url = _public_url_for_key(save_path)
+            else:
+                thumbnail_url = ''
 
             source = Source.objects.create(
                 company=company,
                 type=source_type,
-                title=name,
+                title=original_name[:255],
                 url_or_path=save_path,
                 image_description=request.data.get('description', ''),
                 thumbnail_url=thumbnail_url,
                 status='processing',
             )
-            # Dispatch to Celery background task
             process_and_index_source_task.delay(str(source.id))
             return Response(SourceSerializer(source).data, status=status.HTTP_202_ACCEPTED)
 
@@ -95,13 +139,11 @@ class SourceListView(APIView):
             url_or_path=url,
             status='crawling',
         )
-        # Dispatch to Celery background task
         process_and_index_source_task.delay(str(source.id))
         return Response(SourceSerializer(source).data, status=status.HTTP_202_ACCEPTED)
 
 
 class SourceDetailView(APIView):
-    # Enforce standard authentication AND strict paid subscription checks
     permission_classes = [permissions.IsAuthenticated, HasPaidSubscription]
 
     def delete(self, request, pk):
@@ -110,5 +152,16 @@ class SourceDetailView(APIView):
             source = Source.objects.get(pk=pk, company=company)
         except Source.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
+
+        # Best-effort file cleanup from local disk or R2
+        for val in [source.url_or_path, source.thumbnail_url]:
+            key = _key_from_stored_url(val or "")
+            if key:
+                try:
+                    if default_storage.exists(key):
+                        default_storage.delete(key)
+                except Exception:
+                    pass
+
         source.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)

@@ -1,8 +1,8 @@
+import re
+import uuid
 from datetime import timedelta
-import os
 from django.conf import settings
 from django.utils import timezone
-from django.db.models import Count, Q
 from django.core.files.storage import default_storage
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -12,6 +12,47 @@ from .models import Company
 from .serializers import CompanySerializer
 from chat.models import Conversation, Message
 from knowledge.models import Source, DocumentChunk
+
+
+def _safe_filename(original: str) -> str:
+    original = (original or "logo").strip().replace(" ", "_")
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', original)
+    if not safe or safe in (".", ".."):
+        safe = "logo.png"
+    prefix = uuid.uuid4().hex[:8]
+    return f"{prefix}_{safe}"[:200]
+
+
+def _public_url_for_key(save_path: str) -> str:
+    use_r2 = getattr(settings, 'USE_R2', False)
+    if use_r2:
+        try:
+            url = default_storage.url(save_path)
+            if url.startswith("//"):
+                return "https:" + url
+            if url.startswith("http://") or url.startswith("https://"):
+                return url.replace(" ", "%20")
+        except Exception:
+            pass
+        base = getattr(settings, 'R2_PUBLIC_BASE_URL', '').rstrip('/')
+        if base:
+            return f"{base}/{save_path.replace(' ', '%20')}"
+        return save_path
+    backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000').rstrip('/')
+    return f"{backend_url}/media/{save_path}"
+
+
+def _key_from_logo_url(url: str) -> str:
+    if not url:
+        return ""
+    base = getattr(settings, 'R2_PUBLIC_BASE_URL', '').rstrip('/')
+    if base and url.startswith(base):
+        return url[len(base):].lstrip("/")
+    if "/media/" in url:
+        return url.split("/media/")[-1].lstrip("/")
+    if url.startswith("http://") or url.startswith("https://"):
+        return ""
+    return url.lstrip("/")
 
 
 class CompanyMeView(APIView):
@@ -33,18 +74,18 @@ class CompanyMeView(APIView):
         if 'logo_file' in request.FILES:
             logo_file = request.FILES['logo_file']
 
-            # Clean up old logo file from disk if it exists
+            # Clean up old logo file from local disk or R2
             if company.widget_logo_url:
                 try:
-                    old_path = company.widget_logo_url.split('/media/')[-1]
-                    if default_storage.exists(old_path):
-                        default_storage.delete(old_path)
+                    old_key = _key_from_logo_url(company.widget_logo_url)
+                    if old_key and default_storage.exists(old_key):
+                        default_storage.delete(old_key)
                 except Exception:
                     pass
 
-            save_path = default_storage.save(f'logos/{company.id}/{logo_file.name}', logo_file)
-            backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000').rstrip('/')
-            company.widget_logo_url = f"{backend_url}/media/{save_path}"
+            safe_name = _safe_filename(getattr(logo_file, 'name', 'logo.png'))
+            save_path = default_storage.save(f'logos/{company.id}/{safe_name}', logo_file)
+            company.widget_logo_url = _public_url_for_key(save_path)
             company.save(update_fields=['widget_logo_url'])
 
         # 2. Update text and configuration fields
@@ -67,11 +108,9 @@ class CompanyAnalyticsView(APIView):
         now = timezone.now()
         thirty_days_ago = now - timedelta(days=30)
 
-        # 1. Total & Monthly Conversations
         all_conversations = Conversation.objects.filter(company=company)
         total_conversations_count = all_conversations.count()
 
-        # 2. AI Resolution Rate
         ai_resolved_count = all_conversations.filter(status='ai').count()
         human_handoff_count = all_conversations.filter(status__in=['human', 'live']).count()
 
@@ -80,17 +119,14 @@ class CompanyAnalyticsView(APIView):
         else:
             ai_resolution_pct = 100
 
-        # 3. Knowledge Base Stats
         sources_count = Source.objects.filter(company=company, status='indexed').count()
         chunks_count = DocumentChunk.objects.filter(company=company).count()
 
-        # 4. Message Volume (This Month)
         messages_this_month = Message.objects.filter(
             conversation__company=company,
             created_at__gte=thirty_days_ago
         ).count()
 
-        # 5. Last 7 Days Conversation Activity Chart
         weekly_activity = []
         days_map = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
         for i in range(6, -1, -1):
@@ -99,7 +135,6 @@ class CompanyAnalyticsView(APIView):
             count = all_conversations.filter(created_at__date=day_date).count()
             weekly_activity.append({"day": day_name, "value": count, "date": str(day_date)})
 
-        # 6. Recent 5 Conversations
         recent_qs = all_conversations.order_by('-updated_at')[:5]
         recent_conversations = []
         for conv in recent_qs:
