@@ -21,7 +21,10 @@ class DashboardConsumer(AsyncWebsocketConsumer):
             await self.accept()
         except Exception as e:
             print(f"[WebSocket Error] DashboardConsumer connect failed: {e}")
-            await self.close(code=4001)
+            try:
+                await self.close(code=4001)
+            except Exception:
+                pass
 
     async def disconnect(self, close_code):
         try:
@@ -33,14 +36,17 @@ class DashboardConsumer(AsyncWebsocketConsumer):
             pass
 
     async def handoff_alert(self, event):
-        await self.send(text_data=json.dumps({
-            "type": "handoff_alert",
-            "conversation_id": event["conversation_id"],
-            "visitor_identifier": event["visitor_identifier"],
-            "preview_text": event["preview_text"],
-            "status": event["status"],
-            "updated_at": event["updated_at"],
-        }))
+        try:
+            await self.send(text_data=json.dumps({
+                "type": "handoff_alert",
+                "conversation_id": event.get("conversation_id"),
+                "visitor_identifier": event.get("visitor_identifier"),
+                "preview_text": event.get("preview_text"),
+                "status": event.get("status"),
+                "updated_at": event.get("updated_at"),
+            }))
+        except Exception as e:
+            print(f"[WebSocket Warning] handoff_alert send failed: {e}")
 
 
 class ChatConsumer(AsyncWebsocketConsumer):
@@ -56,7 +62,10 @@ class ChatConsumer(AsyncWebsocketConsumer):
             await self.accept()
         except Exception as e:
             print(f"[WebSocket Error] ChatConsumer connect failed: {e}")
-            await self.close(code=4001)
+            try:
+                await self.close(code=4001)
+            except Exception:
+                pass
 
     async def disconnect(self, close_code):
         try:
@@ -68,7 +77,10 @@ class ChatConsumer(AsyncWebsocketConsumer):
             pass
 
     async def chat_message(self, event):
-        await self.send(text_data=json.dumps({
-            "type": "chat_message",
-            "message": event["message"]
-        }))
+        try:
+            await self.send(text_data=json.dumps({
+                "type": "chat_message",
+                "message": event.get("message")
+            }))
+        except Exception as e:
+            print(f"[WebSocket Warning] chat_message send failed: {e}")

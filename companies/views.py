@@ -103,7 +103,18 @@ class CompanyAnalyticsView(APIView):
     def get(self, request):
         company = getattr(request.user, 'company', None)
         if not company:
-            return Response({"error": "No company associated with user."}, status=status.HTTP_400_BAD_REQUEST)
+            # Safe fallback for users without a company (returns 200 rather than 400)
+            return Response({
+                "total_conversations": 0,
+                "ai_resolution_rate": 100,
+                "pages_indexed": 0,
+                "chunks_indexed": 0,
+                "messages_this_month": 0,
+                "human_handoffs": 0,
+                "avg_response_time": "0.0s",
+                "weekly_activity": [],
+                "recent_conversations": [],
+            }, status=status.HTTP_200_OK)
 
         now = timezone.now()
         thirty_days_ago = now - timedelta(days=30)

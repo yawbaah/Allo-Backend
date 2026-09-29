@@ -24,10 +24,6 @@ def get_stripe_prices():
 
 
 def send_welcome_and_activation_email(company, email_address, plan_name):
-    """
-    Sends a formatted transactional HTML email to the customer
-    confirming subscription activation and next steps.
-    """
     subject = f"Your Allo {plan_name.capitalize()} Plan is Now Active! 💳"
     dashboard_url = f"{settings.FRONTEND_URL}/dashboard"
     knowledge_url = f"{settings.FRONTEND_URL}/dashboard/knowledge"
@@ -117,10 +113,6 @@ def send_welcome_and_activation_email(company, email_address, plan_name):
 
 
 def send_dunning_warning_email(company, email_address):
-    """
-    Sends a structured HTML email warning the administrator that their
-    unpaid/failed subscription has locked their live customer widget.
-    """
     subject = "Action Required: Your Allo subscription is past due ⚠️"
     billing_url = f"{settings.FRONTEND_URL}/dashboard/billing"
 
@@ -193,7 +185,16 @@ class BillingDashboardView(APIView):
     def get(self, request):
         company = getattr(request.user, 'company', None)
         if not company:
-            return Response({"error": "No company associated with this user."}, status=status.HTTP_400_BAD_REQUEST)
+            # Safe fallback for users without a company (returns 200 rather than 400)
+            return Response({
+                "plan": "starter",
+                "subscription_status": "unpaid",
+                "message_usage": 0,
+                "message_limit": 1000,
+                "usage_percentage": 0,
+                "current_period_end": None,
+                "has_active_credits": False,
+            }, status=status.HTTP_200_OK)
 
         usage = company.get_current_period_usage()
         max_limit = company.max_monthly_messages
@@ -284,9 +285,8 @@ class CreateBillingPortalView(APIView):
                 return_url=f"{frontend_url}/dashboard/billing",
             )
             return Response({"portal_url": portal_session.url}, status=status.HTTP_200_OK)
-            
+
         except stripe.error.StripeError as e:
-            # USER-FRIENDLY EXCEPTION BOUNDARY: Catches Stripe-specific errors
             print(f"[Stripe Portal Error] {e}")
             return Response(
                 {"error": "Billing portal is temporarily unavailable. If you haven't completed your initial subscription payment, please select a plan first."},
@@ -327,7 +327,6 @@ class StripeWebhookView(APIView):
 
         print(f"\n🔔 [STRIPE EVENT RECEIVED] Processing: '{event_type}'")
 
-        # 1. Checkout completed successfully
         if event_type == "checkout.session.completed":
             metadata = data_object.get('metadata') or {}
             company_id = metadata.get('company_id')
@@ -387,7 +386,6 @@ class StripeWebhookView(APIView):
             else:
                 print(f"❌ [STRIPE WEBHOOK ERROR] No matching company found for company_id: {company_id}")
 
-        # 2. Subscription updated, cancelled, or delinquent
         elif event_type in ["customer.subscription.updated", "customer.subscription.deleted"]:
             sub_id = data_object.get('id')
             sub_status = data_object.get('status')
@@ -403,7 +401,6 @@ class StripeWebhookView(APIView):
 
                 if period_start:
                     new_period_start = datetime.fromtimestamp(period_start, tz=dt_timezone.utc)
-                    # If the billing period has changed, reset the usage counter
                     if old_period_start and new_period_start > old_period_start:
                         company.reset_usage()
                         print(f"🔄 [BILLING CYCLE RESET] Usage counter reset for '{company.name}'.")
@@ -412,11 +409,9 @@ class StripeWebhookView(APIView):
                 if period_end:
                     company.current_period_end = datetime.fromtimestamp(period_end, tz=dt_timezone.utc)
 
-                # Lock the account if Stripe marks the subscription delinquent, past_due, canceled, or unpaid
                 if event_type == "customer.subscription.deleted" or sub_status in ["canceled", "unpaid", "past_due"]:
-                    company.subscription_status = 'unpaid'  # Lock dashboard & block API access
+                    company.subscription_status = 'unpaid'
 
-                    # Extract target recipient email
                     recipient_email = None
                     associated_user = company.users.first()
                     if associated_user:
@@ -424,7 +419,6 @@ class StripeWebhookView(APIView):
                     else:
                         recipient_email = company.support_email
 
-                    # Fire off alert warning email
                     if recipient_email:
                         send_dunning_warning_email(company, recipient_email)
 

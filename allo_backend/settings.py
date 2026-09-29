@@ -94,15 +94,26 @@ else:
     }
 
 # ---------------------------------------------------------------------------
-# REDIS & CHANNELS
+# REDIS & CHANNELS (Python 3.13 + Railway RESP2 Keepalive Fix)
 # ---------------------------------------------------------------------------
 REDIS_URL = os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/0')
+
+# Force RESP2 protocol + keepalive + health check to prevent Python 3.13 asyncio timeouts
+def _build_channel_redis_url(base_url: str) -> str:
+    extras = "protocol=2&health_check_interval=15&socket_keepalive=true&socket_timeout=60"
+    if not base_url:
+        return f"redis://127.0.0.1:6379/0?{extras}"
+    return f"{base_url}{'&' if '?' in base_url else '?'}{extras}"
+
+REDIS_CHANNELS_URL = _build_channel_redis_url(REDIS_URL)
 
 CHANNEL_LAYERS = {
     'default': {
         'BACKEND': 'channels_redis.core.RedisChannelLayer',
         'CONFIG': {
-            "hosts": [REDIS_URL],
+            "hosts": [REDIS_CHANNELS_URL],
+            "capacity": 1500,
+            "expiry": 30,
         },
     },
 }
