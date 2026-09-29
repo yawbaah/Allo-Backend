@@ -193,7 +193,6 @@ class BillingDashboardView(APIView):
     def get(self, request):
         company = getattr(request.user, 'company', None)
         if not company:
-            # Safe fallback for users without a company (returns 200 rather than 400)
             return Response({
                 "plan": "starter",
                 "subscription_status": "unpaid",
@@ -293,9 +292,8 @@ class CreateBillingPortalView(APIView):
                 return_url=f"{frontend_url}/dashboard/billing",
             )
             return Response({"portal_url": portal_session.url}, status=status.HTTP_200_OK)
-            
+
         except stripe.error.StripeError as e:
-            # USER-FRIENDLY EXCEPTION BOUNDARY: Catches Stripe-specific errors
             print(f"[Stripe Portal Error] {e}")
             return Response(
                 {"error": "Billing portal is temporarily unavailable. If you haven't completed your initial subscription payment, please select a plan first."},
@@ -336,7 +334,6 @@ class StripeWebhookView(APIView):
 
         print(f"\n🔔 [STRIPE EVENT RECEIVED] Processing: '{event_type}'")
 
-        # 1. Checkout completed successfully
         if event_type == "checkout.session.completed":
             metadata = data_object.get('metadata') or {}
             company_id = metadata.get('company_id')
@@ -396,7 +393,6 @@ class StripeWebhookView(APIView):
             else:
                 print(f"❌ [STRIPE WEBHOOK ERROR] No matching company found for company_id: {company_id}")
 
-        # 2. Subscription updated, cancelled, or delinquent
         elif event_type in ["customer.subscription.updated", "customer.subscription.deleted"]:
             sub_id = data_object.get('id')
             sub_status = data_object.get('status')
@@ -412,7 +408,6 @@ class StripeWebhookView(APIView):
 
                 if period_start:
                     new_period_start = datetime.fromtimestamp(period_start, tz=dt_timezone.utc)
-                    # If the billing period has changed, reset the usage counter
                     if old_period_start and new_period_start > old_period_start:
                         company.reset_usage()
                         print(f"🔄 [BILLING CYCLE RESET] Usage counter reset for '{company.name}'.")
@@ -421,11 +416,9 @@ class StripeWebhookView(APIView):
                 if period_end:
                     company.current_period_end = datetime.fromtimestamp(period_end, tz=dt_timezone.utc)
 
-                # Lock the account if Stripe marks the subscription delinquent, past_due, canceled, or unpaid
                 if event_type == "customer.subscription.deleted" or sub_status in ["canceled", "unpaid", "past_due"]:
-                    company.subscription_status = 'unpaid'  # Lock dashboard & block API access
+                    company.subscription_status = 'unpaid'
 
-                    # Extract target recipient email
                     recipient_email = None
                     associated_user = company.users.first()
                     if associated_user:
@@ -433,7 +426,6 @@ class StripeWebhookView(APIView):
                     else:
                         recipient_email = company.support_email
 
-                    # Fire off alert warning email
                     if recipient_email:
                         send_dunning_warning_email(company, recipient_email)
 
@@ -454,176 +446,3 @@ class StripeWebhookView(APIView):
                 print(f"❌ [STRIPE WEBHOOK ERROR] Company with Subscription '{sub_id}' not found.")
 
         return Response({"status": "success"}, status=status.HTTP_200_OK)
-
-
-
-import re
-import uuid
-from datetime import timedelta
-from django.conf import settings
-from django.utils import timezone
-from django.core.files.storage import default_storage
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status, permissions
-
-from .models import Company
-from .serializers import CompanySerializer
-from chat.models import Conversation, Message
-from knowledge.models import Source, DocumentChunk
-
-
-def _safe_filename(original: str) -> str:
-    original = (original or "logo").strip().replace(" ", "_")
-    safe = re.sub(r'[^A-Za-z0-9._-]', '_', original)
-    if not safe or safe in (".", ".."):
-        safe = "logo.png"
-    prefix = uuid.uuid4().hex[:8]
-    return f"{prefix}_{safe}"[:200]
-
-
-def _public_url_for_key(save_path: str) -> str:
-    use_r2 = getattr(settings, 'USE_R2', False)
-    if use_r2:
-        try:
-            url = default_storage.url(save_path)
-            if url.startswith("//"):
-                return "https:" + url
-            if url.startswith("http://") or url.startswith("https://"):
-                return url.replace(" ", "%20")
-        except Exception:
-            pass
-        base = getattr(settings, 'R2_PUBLIC_BASE_URL', '').rstrip('/')
-        if base:
-            return f"{base}/{save_path.replace(' ', '%20')}"
-        return save_path
-    backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000').rstrip('/')
-    return f"{backend_url}/media/{save_path}"
-
-
-def _key_from_logo_url(url: str) -> str:
-    if not url:
-        return ""
-    base = getattr(settings, 'R2_PUBLIC_BASE_URL', '').rstrip('/')
-    if base and url.startswith(base):
-        return url[len(base):].lstrip("/")
-    if "/media/" in url:
-        return url.split("/media/")[-1].lstrip("/")
-    if url.startswith("http://") or url.startswith("https://"):
-        return ""
-    return url.lstrip("/")
-
-
-class CompanyMeView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        company = getattr(request.user, 'company', None)
-        if not company:
-            return Response({"error": "No company associated with this user."}, status=status.HTTP_404_NOT_FOUND)
-        serializer = CompanySerializer(company)
-        return Response(serializer.data, status=status.HTTP_200_OK)
-
-    def patch(self, request):
-        company = getattr(request.user, 'company', None)
-        if not company:
-            return Response({"error": "No company associated with this user."}, status=status.HTTP_404_NOT_FOUND)
-
-        # 1. Handle permanent logo file upload if provided
-        if 'logo_file' in request.FILES:
-            logo_file = request.FILES['logo_file']
-
-            # Clean up old logo file from local disk or R2
-            if company.widget_logo_url:
-                try:
-                    old_key = _key_from_logo_url(company.widget_logo_url)
-                    if old_key and default_storage.exists(old_key):
-                        default_storage.delete(old_key)
-                except Exception:
-                    pass
-
-            safe_name = _safe_filename(getattr(logo_file, 'name', 'logo.png'))
-            save_path = default_storage.save(f'logos/{company.id}/{safe_name}', logo_file)
-            company.widget_logo_url = _public_url_for_key(save_path)
-            company.save(update_fields=['widget_logo_url'])
-
-        # 2. Update text and configuration fields
-        serializer = CompanySerializer(company, data=request.data, partial=True)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(CompanySerializer(company).data, status=status.HTTP_200_OK)
-
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-class CompanyAnalyticsView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        company = getattr(request.user, 'company', None)
-        if not company:
-            # Safe fallback for users without a company (returns 200 rather than 400)
-            return Response({
-                "total_conversations": 0,
-                "ai_resolution_rate": 100,
-                "pages_indexed": 0,
-                "chunks_indexed": 0,
-                "messages_this_month": 0,
-                "human_handoffs": 0,
-                "avg_response_time": "0.0s",
-                "weekly_activity": [],
-                "recent_conversations": [],
-            }, status=status.HTTP_200_OK)
-
-        now = timezone.now()
-        thirty_days_ago = now - timedelta(days=30)
-
-        all_conversations = Conversation.objects.filter(company=company)
-        total_conversations_count = all_conversations.count()
-
-        ai_resolved_count = all_conversations.filter(status='ai').count()
-        human_handoff_count = all_conversations.filter(status__in=['human', 'live']).count()
-
-        if total_conversations_count > 0:
-            ai_resolution_pct = round((ai_resolved_count / total_conversations_count) * 100)
-        else:
-            ai_resolution_pct = 100
-
-        sources_count = Source.objects.filter(company=company, status='indexed').count()
-        chunks_count = DocumentChunk.objects.filter(company=company).count()
-
-        messages_this_month = Message.objects.filter(
-            conversation__company=company,
-            created_at__gte=thirty_days_ago
-        ).count()
-
-        weekly_activity = []
-        days_map = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-        for i in range(6, -1, -1):
-            day_date = (now - timedelta(days=i)).date()
-            day_name = days_map[day_date.weekday()]
-            count = all_conversations.filter(created_at__date=day_date).count()
-            weekly_activity.append({"day": day_name, "value": count, "date": str(day_date)})
-
-        recent_qs = all_conversations.order_by('-updated_at')[:5]
-        recent_conversations = []
-        for conv in recent_qs:
-            recent_conversations.append({
-                "id": str(conv.id),
-                "visitor": conv.visitor_identifier,
-                "preview": conv.preview_text or "No message preview",
-                "status": conv.status,
-                "time": conv.updated_at.isoformat(),
-            })
-
-        return Response({
-            "total_conversations": total_conversations_count,
-            "ai_resolution_rate": ai_resolution_pct,
-            "pages_indexed": sources_count,
-            "chunks_indexed": chunks_count,
-            "messages_this_month": messages_this_month,
-            "human_handoffs": human_handoff_count,
-            "avg_response_time": "1.2s",
-            "weekly_activity": weekly_activity,
-            "recent_conversations": recent_conversations,
-        }, status=status.HTTP_200_OK)
