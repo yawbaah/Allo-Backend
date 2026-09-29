@@ -98,7 +98,6 @@ else:
 # ---------------------------------------------------------------------------
 REDIS_URL = os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/0')
 
-# Force RESP2 protocol + keepalive + health check to prevent Python 3.13 asyncio timeouts
 def _build_channel_redis_url(base_url: str) -> str:
     extras = "protocol=2&health_check_interval=15&socket_keepalive=true&socket_timeout=60"
     if not base_url:
